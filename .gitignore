@@ -11,8 +11,8 @@ wheels/
 ai/.env
 
 # Generated data
-data/*.jsonl
-data/*.md
+#data/*.jsonl
+#data/*.md
 
 # Editors
 .idea/
