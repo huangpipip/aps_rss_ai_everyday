@@ -5,12 +5,17 @@ on:
   schedule:
     - cron: "30 2 * * *"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
@@ -71,6 +76,7 @@ jobs:
           cd ai
           export OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
           export OPENAI_BASE_URL="${{ secrets.OPENAI_BASE_URL }}"
+          export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
           export LANGUAGE="${{ vars.LANGUAGE }}"
           export MODEL_NAME="${{ vars.MODEL_NAME }}"
           python enhance.py --data "../data/${today}.jsonl"
@@ -85,3 +91,56 @@ jobs:
 
           cd to_md
           python convert.py --data "../data/${today}_AI_enhanced_${LANGUAGE}.jsonl"
+
+      - name: Upload generated artifacts
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps-rss-${{ steps.crawl_step.outputs.crawl_date }}
+          path: |
+            data/${{ steps.crawl_step.outputs.crawl_date }}.jsonl
+            data/${{ steps.crawl_step.outputs.crawl_date }}_AI_enhanced_${{ vars.LANGUAGE }}.jsonl
+            data/${{ steps.crawl_step.outputs.crawl_date }}.md
+          if-no-files-found: error
+
+      - name: Commit generated data
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        run: |
+          today=${{ steps.crawl_step.outputs.crawl_date }}
+          language="${{ vars.LANGUAGE }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "data/${today}.jsonl"
+          git add "data/${today}_AI_enhanced_${language}.jsonl"
+          git add "data/${today}.md"
+
+          if git diff --cached --quiet; then
+            echo "No generated data changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore: store APS RSS outputs for ${today}"
+
+      - name: Push generated data
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        run: |
+          branch="${{ github.ref_name }}"
+
+          for attempt in 1 2 3; do
+            git fetch origin "${branch}"
+            git rebase "origin/${branch}" || {
+              git rebase --abort
+              echo "Rebase failed on attempt ${attempt}"
+              exit 1
+            }
+
+            if git push origin "HEAD:${branch}"; then
+              echo "Push succeeded"
+              exit 0
+            fi
+          done
+
+          echo "Push failed after retries"
+          exit 1
