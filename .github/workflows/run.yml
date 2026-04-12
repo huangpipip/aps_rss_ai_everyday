@@ -1,0 +1,87 @@
+name: backend-pipeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv sync
+
+      - name: Crawl source data
+        id: crawl_step
+        run: |
+          source .venv/bin/activate
+          today=$(date -u "+%Y-%m-%d")
+
+          rm -f "data/${today}.jsonl"
+
+          cd daily_arxiv
+          export APS_FEEDS="${{ vars.APS_FEEDS }}"
+          export PAPER_LIMIT="${{ vars.PAPER_LIMIT }}"
+          python daily_arxiv/fetch_aps.py --data "../data/${today}.jsonl"
+
+          if [ ! -f "../data/${today}.jsonl" ]; then
+            echo "Fetching failed"
+            exit 1
+          fi
+
+          echo "crawl_date=$today" >> "$GITHUB_OUTPUT"
+
+      - name: Deduplicate
+        id: dedup_check
+        run: |
+          source .venv/bin/activate
+          cd daily_arxiv
+
+          set +e
+          python daily_arxiv/check_stats.py
+          dedup_exit_code=$?
+          set -e
+
+          echo "dedup_exit_code=$dedup_exit_code" >> "$GITHUB_OUTPUT"
+
+          case $dedup_exit_code in
+            0)
+              echo "has_new_content=true" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "has_new_content=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+
+      - name: AI enhancement
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        run: |
+          source .venv/bin/activate
+          today=${{ steps.crawl_step.outputs.crawl_date }}
+
+          cd ai
+          export OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
+          export OPENAI_BASE_URL="${{ secrets.OPENAI_BASE_URL }}"
+          export LANGUAGE="${{ vars.LANGUAGE }}"
+          export MODEL_NAME="${{ vars.MODEL_NAME }}"
+          python enhance.py --data "../data/${today}.jsonl"
+
+      - name: Convert to markdown
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        run: |
+          source .venv/bin/activate
+          today=${{ steps.crawl_step.outputs.crawl_date }}
+          export LANGUAGE="${{ vars.LANGUAGE }}"
+          export APS_FEEDS="${{ vars.APS_FEEDS }}"
+
+          cd to_md
+          python convert.py --data "../data/${today}_AI_enhanced_${LANGUAGE}.jsonl"
