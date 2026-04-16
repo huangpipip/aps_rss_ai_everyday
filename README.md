@@ -1,6 +1,6 @@
 # APS RSS AI Backend
 
-这个仓库改造了https://github.com/dw-dengwei/daily-arXiv-ai-enhanced中的后端部分
+这个仓库改造了https://github.com/dw-dengwei/daily-arXiv-ai-enhanced 中的后端部分
 
 实现对APS(美国物理学会)期刊的RSS抓取和AI总结
 
