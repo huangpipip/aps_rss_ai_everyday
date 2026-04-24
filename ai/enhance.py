@@ -3,7 +3,7 @@ import json
 import sys
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict
+from typing import Any, Dict, List
 from queue import Queue
 from threading import Lock
 # INSERT_YOUR_CODE
@@ -27,6 +27,20 @@ if os.path.exists('.env'):
 template = open("template.txt", "r").read()
 system = open("system.txt", "r").read()
 
+DEFAULT_AI_FIELDS = {
+    "tldr": "Summary generation failed",
+    "motivation": "Motivation analysis unavailable",
+    "method": "Method extraction failed",
+    "result": "Result analysis unavailable",
+    "conclusion": "Conclusion extraction failed",
+}
+
+JSON_ONLY_INSTRUCTIONS = """
+Return only a valid JSON object with exactly these keys:
+{{"tldr": "...", "motivation": "...", "method": "...", "result": "...", "conclusion": "..."}}
+Do not wrap the JSON in markdown code fences.
+""".strip()
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser()
@@ -34,7 +48,57 @@ def parse_args():
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
     return parser.parse_args()
 
-def process_single_item(chain, item: Dict, language: str) -> Dict:
+def supports_function_calling(model_name: str) -> bool:
+    normalized = model_name.lower()
+    unsupported_models = (
+        "deepseek-v4",
+        "deepseek-reasoner",
+    )
+    return not any(model in normalized for model in unsupported_models)
+
+def normalize_message_content(response: Any) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+def extract_json_object(raw_text: str) -> str:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("No JSON object found in model response")
+    return cleaned[start:end + 1]
+
+def invoke_chain(chain, item: Dict, language: str, structured_output: bool) -> Structure:
+    payload = {
+        "language": language,
+        "content": item["summary"],
+    }
+
+    if structured_output:
+        return chain.invoke(payload)
+
+    response = chain.invoke(payload)
+    raw_text = normalize_message_content(response)
+    parsed_json = json.loads(extract_json_object(raw_text))
+    return Structure.model_validate(parsed_json)
+
+def process_single_item(chain, item: Dict, language: str, structured_output: bool) -> Dict:
     def is_sensitive(content: str) -> bool:
         """
         调用 spam.dw-dengwei.workers.dev 接口检测内容是否包含敏感词。
@@ -115,20 +179,8 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         item.update(code_info)
 
     """处理单个数据项"""
-    # Default structure with meaningful fallback values
-    default_ai_fields = {
-        "tldr": "Summary generation failed",
-        "motivation": "Motivation analysis unavailable",
-        "method": "Method extraction failed",
-        "result": "Result analysis unavailable",
-        "conclusion": "Conclusion extraction failed"
-    }
-    
     try:
-        response: Structure = chain.invoke({
-            "language": language,
-            "content": item['summary']
-        })
+        response = invoke_chain(chain, item, language, structured_output)
         item['AI'] = response.model_dump()
     except langchain_core.exceptions.OutputParserException as e:
         # 尝试从错误信息中提取 JSON 字符串并修复
@@ -147,17 +199,17 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
                 print(f"Failed to parse JSON for {item.get('id', 'unknown')}: {json_e}", file=sys.stderr)
         
         # Merge partial data with defaults to ensure all fields exist
-        item['AI'] = {**default_ai_fields, **partial_data}
+        item['AI'] = {**DEFAULT_AI_FIELDS, **partial_data}
         print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
     except Exception as e:
         # Catch any other exceptions and provide default values
         print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        item['AI'] = default_ai_fields
+        item['AI'] = DEFAULT_AI_FIELDS.copy()
     
     # Final validation to ensure all required fields exist
-    for field in default_ai_fields.keys():
+    for field in DEFAULT_AI_FIELDS.keys():
         if field not in item['AI']:
-            item['AI'][field] = default_ai_fields[field]
+            item['AI'][field] = DEFAULT_AI_FIELDS[field]
 
     # 检查 AI 生成的所有字段
     for v in item.get("AI", {}).values():
@@ -167,13 +219,23 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
 
 def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
     """并行处理所有数据项"""
-    llm = ChatOpenAI(model=model_name).with_structured_output(Structure, method="function_calling")
+    structured_output = supports_function_calling(model_name)
+    llm = ChatOpenAI(model=model_name)
+    if structured_output:
+        llm = llm.with_structured_output(Structure, method="function_calling")
+    else:
+        print(
+            "Structured output disabled for this model; using prompt-only JSON parsing fallback",
+            file=sys.stderr,
+        )
     print('Connect to:', model_name, file=sys.stderr)
-    
-    prompt_template = ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(system),
-        HumanMessagePromptTemplate.from_template(template=template)
-    ])
+
+    prompt_messages = [SystemMessagePromptTemplate.from_template(system)]
+    if not structured_output:
+        prompt_messages.append(SystemMessagePromptTemplate.from_template(JSON_ONLY_INSTRUCTIONS))
+    prompt_messages.append(HumanMessagePromptTemplate.from_template(template=template))
+
+    prompt_template = ChatPromptTemplate.from_messages(prompt_messages)
 
     chain = prompt_template | llm
     
@@ -182,7 +244,7 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         future_to_idx = {
-            executor.submit(process_single_item, chain, item, language): idx
+            executor.submit(process_single_item, chain, item, language, structured_output): idx
             for idx, item in enumerate(data)
         }
         
